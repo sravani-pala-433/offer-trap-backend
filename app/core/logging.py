@@ -1,42 +1,45 @@
 import logging
-import os
-import sys
+from contextvars import ContextVar, Token
+
+from app.core.settings import settings
 
 
-def configure_logging():
-    # Get the log level from the environment, defaulting to DEBUG if not set
-    log_level = os.getenv("LOG_LEVEL", "DEBUG").upper()
+_request_id: ContextVar[str] = ContextVar("offertrap_request_id", default="-")
 
-    # Validate the log level and set the logging level accordingly
-    log_level_dict = {
-        "DEBUG": logging.DEBUG,
-        "INFO": logging.INFO,
-        "WARNING": logging.WARNING,
-        "ERROR": logging.ERROR,
-        "CRITICAL": logging.CRITICAL
-    }
 
-    level = log_level_dict.get(log_level, logging.DEBUG)  # Default to DEBUG if invalid level
+class RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "request_id"):
+            record.request_id = _request_id.get()
+        return True
 
-    logger = logging.getLogger()  # Root logger
-    logger.setLevel(level)  # Set root logger level dynamically
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.DEBUG)
 
+def bind_request_id(request_id: str) -> Token[str]:
+    return _request_id.set(request_id)
+
+
+def reset_request_id(token: Token[str]) -> None:
+    _request_id.reset(token)
+
+
+def configure_logging() -> None:
+    level = getattr(logging, settings.log_level.upper(), logging.INFO)
     formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(filename)s - %(lineno)d - %(funcName)s - %(message)s"
+        fmt="%(asctime)s.%(msecs)03d %(levelname)s %(name)s:%(lineno)d request_id=%(request_id)s %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
     )
-    console_handler.setFormatter(formatter)
+    logging.basicConfig(
+        level=level,
+    )
+    root_logger = logging.getLogger()
+    root_logger.setLevel(level)
+    if not root_logger.handlers:
+        root_logger.addHandler(logging.StreamHandler())
+    for handler in root_logger.handlers:
+        if not any(isinstance(item, RequestIdFilter) for item in handler.filters):
+            handler.addFilter(RequestIdFilter())
+        handler.setFormatter(formatter)
 
-    # File handler for logging into a file
-    file_handler = logging.FileHandler("app.log",
-                                       encoding="utf-8")
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(formatter)
-    logger.handlers.clear() #clear all handlers
-    logger.addHandler(console_handler)
-    logger.addHandler(file_handler)
 
-
-def get_logger(name:str): #helper function to get logger
+def get_logger(name: str) -> logging.Logger:
     return logging.getLogger(name)

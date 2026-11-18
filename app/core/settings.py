@@ -22,15 +22,17 @@ class Settings(BaseSettings):
     admin_username: str | None = None
     admin_password: SecretStr | None = None
 
-    b2_region: str | None = None
-    b2_endpoint_url: str | None = None
-    b2_application_key_id: SecretStr | None = None
-    b2_application_key: SecretStr | None = None
-    b2_bucket_name: str | None = None
-    b2_presigned_url_ttl_seconds: int = Field(default=600, ge=60, le=3600)
+    evidence_upload_ttl_minutes: int = Field(default=60, ge=15, le=1440)
 
-    frontend_origins: str = "http://localhost:5173", "https://offer-trap.vercel.app/"
-    reward_points_per_approved_report: int = Field(default=100, ge=0)
+    # Neon Object Storage exposes an S3-compatible endpoint. Keep credentials
+    # optional so non-upload API routes can start even before storage is set up.
+    aws_endpoint_url_s3: str | None = None
+    aws_region: str | None = None
+    aws_access_key_id: SecretStr | None = None
+    aws_secret_access_key: SecretStr | None = None
+    neon_storage_bucket: str | None = None
+
+    frontend_origins: str = "http://localhost:5173,https://offer-trap.vercel.app"
     log_level: str = "INFO"
 
     @property
@@ -38,27 +40,19 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.frontend_origins.split(",") if origin.strip()]
 
     @property
-    def resolved_b2_endpoint_url(self) -> str | None:
-        if self.b2_endpoint_url:
-            return self.b2_endpoint_url.rstrip("/")
-        if self.b2_region and self.b2_region.strip():
-            return f"https://s3.{self.b2_region.strip()}.backblazeb2.com"
-        return None
-
-    @property
-    def b2_is_configured(self) -> bool:
+    def neon_storage_is_configured(self) -> bool:
         return bool(
-            self.resolved_b2_endpoint_url
-            and self.b2_region
-            and self.b2_region.strip()
-            and self.b2_application_key_id
-            and self.b2_application_key_id.get_secret_value().strip()
-            and self.b2_application_key
-            and self.b2_application_key.get_secret_value().strip()
-            and self.b2_bucket_name
-            and self.b2_bucket_name.strip()
+            self.aws_endpoint_url_s3
+            and self.aws_endpoint_url_s3.strip()
+            and self.aws_region
+            and self.aws_region.strip()
+            and self.aws_access_key_id
+            and self.aws_access_key_id.get_secret_value().strip()
+            and self.aws_secret_access_key
+            and self.aws_secret_access_key.get_secret_value().strip()
+            and self.neon_storage_bucket
+            and self.neon_storage_bucket.strip()
         )
-
 
 @lru_cache
 def get_settings() -> Settings:

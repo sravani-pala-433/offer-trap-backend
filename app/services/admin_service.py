@@ -5,11 +5,11 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.core.models import ModerationLog, RewardLedger, Report
+from app.core.models import ModerationLog, Report
 from app.core.schemas import AdminLoginRequest, ReportReviewRequest
 from app.core.settings import settings
 from app.repositories import admin_repository
-from app.services.storage_service import B2StorageService
+from app.services import evidence_service
 from app.utils.error_helpers import ServiceError
 from app.utils.jwt_token import create_access_token
 from app.utils.response_helpers import admin_report
@@ -48,9 +48,15 @@ def login(request: AdminLoginRequest) -> dict[str, Any]:
 
 
 def list_reports(
-    session: Session, *, status_filter: str | None, query: str
+    session: Session,
+    *,
+    status_filter: str | None,
+    query: str,
+    submitter_email: str | None,
 ) -> dict[str, list[dict[str, object]]]:
-    reports = admin_repository.list_reports(session, status_filter, query.strip())
+    reports = admin_repository.list_reports(
+        session, status_filter, query.strip(), submitter_email
+    )
     return {"items": [admin_report(report) for report in reports]}
 
 
@@ -67,37 +73,14 @@ def review_report(
 
         previous_status = report.review_status
         next_status = request.status
-        if previous_status == next_status:
-            if request.review_note is not None:
-                report.review_note = request.review_note
-                report.reviewed_by = moderator
-                report.reviewed_at = datetime.now(timezone.utc)
-                admin_repository.add_moderation_log(
-                    session,
-                    ModerationLog(
-                        report_id=report.id,
-                        moderator=moderator,
-                        old_status=previous_status,
-                        new_status=next_status,
-                        note=request.review_note,
-                    ),
-                )
-                session.commit()
-                logger.info(
-                    "moderation_note_updated report_id=%s status=%s",
-                    report.id,
-                    previous_status,
-                )
+        if previous_status == "rejected":
             return admin_report(report)
 
-        report.review_status = next_status
+        report.review_status = "rejected"
+        report.is_public = False
         report.review_note = request.review_note
         report.reviewed_by = moderator
         report.reviewed_at = datetime.now(timezone.utc)
-        if next_status == "approved":
-            report.public_summary = request.public_summary or (
-                f"A community report about {report.company_name} was reviewed and approved."
-            )
         admin_repository.add_moderation_log(
             session,
             ModerationLog(
@@ -108,29 +91,6 @@ def review_report(
                 note=request.review_note,
             ),
         )
-
-        if next_status == "approved" and settings.reward_points_per_approved_report > 0:
-            admin_repository.add_reward_entry(
-                session,
-                RewardLedger(
-                    report_id=report.id,
-                    points=settings.reward_points_per_approved_report,
-                    event_type="award",
-                    moderator=moderator,
-                ),
-            )
-        elif previous_status == "approved" and next_status != "approved":
-            current_balance = sum(entry.points for entry in report.reward_entries)
-            if current_balance > 0:
-                admin_repository.add_reward_entry(
-                    session,
-                    RewardLedger(
-                        report_id=report.id,
-                        points=-current_balance,
-                        event_type="reversal",
-                        moderator=moderator,
-                    ),
-                )
 
         session.commit()
         session.refresh(report)
@@ -147,15 +107,27 @@ def review_report(
         raise
 
 
+def delete_report(session: Session, report_id: str, moderator: str) -> None:
+    try:
+        report = admin_repository.get_report(session, report_id, lock=True)
+        if report is None:
+            raise ServiceError("Report not found.", 404)
+
+        evidence_count = evidence_service.delete_report_evidence(report)
+        session.delete(report)
+        session.commit()
+        logger.info(
+            "admin_report_deleted report_id=%s moderator=%s evidence_files=%d",
+            report_id,
+            moderator,
+            evidence_count,
+        )
+    except Exception:
+        session.rollback()
+        raise
+
+
 def get_evidence_download(
-    session: Session, evidence_id: str, storage: B2StorageService
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    evidence = admin_repository.get_evidence(session, evidence_id)
-    if evidence is None:
-        raise ServiceError("Evidence file not found.", 404)
-    object_response = storage.open_object(evidence.object_key)
-    return {
-        "name": evidence.original_name,
-        "content_type": evidence.content_type,
-        "size_bytes": evidence.size_bytes,
-    }, object_response
+    session: Session, evidence_id: str, chunk_index: int
+) -> tuple[dict[str, Any], Any]:
+    return evidence_service.get_admin_evidence(session, evidence_id, chunk_index)

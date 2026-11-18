@@ -4,42 +4,47 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
-ReviewStatus = Literal["submitted", "under_review", "needs_information", "approved", "rejected"]
-ReviewDecision = Literal["needs_information", "approved", "rejected"]
+ReviewStatus = Literal["submitted", "rejected"]
+ReviewDecision = Literal["rejected"]
 
 
-class PresignFileRequest(BaseModel):
-    filename: str = Field(min_length=1, max_length=255)
-    content_type: str = Field(min_length=1, max_length=120)
+class EvidenceUploadRequest(BaseModel):
+    filename: str = Field(min_length=1)
+    content_type: str = Field(min_length=1)
     size_bytes: int = Field(gt=0)
 
 
-class PresignRequest(BaseModel):
-    files: list[PresignFileRequest] = Field(min_length=1, max_length=5)
-
-
-class PresignedUpload(BaseModel):
+class EvidenceUploadResponse(BaseModel):
     upload_id: str
-    upload_url: str
-    method: Literal["PUT"] = "PUT"
-    headers: dict[str, str]
-    expires_at: datetime
+    chunk_size_bytes: int
+    chunk_count: int
 
 
-class PresignResponse(BaseModel):
-    uploads: list[PresignedUpload]
+class EvidenceUploadCompleteResponse(BaseModel):
+    upload_id: str
+    status: Literal["ready"] = "ready"
 
 
 class ReportCreateRequest(BaseModel):
-    contributor_username: str = Field(min_length=2, max_length=120)
+    contributor_username: str = Field(
+        min_length=2,
+        description="Displayed publicly unless anonymous attribution is selected.",
+    )
     contributor_email: EmailStr
-    anonymous_attribution: bool = False
-    company_name: str = Field(min_length=2, max_length=200)
-    recruiter_contact: str | None = Field(default=None, max_length=10)
-    job_title: str | None = Field(default=None, max_length=200)
-    job_url: str | None = Field(default=None, max_length=2048)
-    category: str = Field(min_length=2, max_length=120)
-    description: str = Field(min_length=20, max_length=10000)
+    anonymous_attribution: bool = Field(
+        default=False,
+        description="Defaults to public name attribution; true displays the contributor as Anonymous.",
+    )
+    company_name: str = Field(min_length=2)
+    recruiter_name: str | None = None
+    recruiter_contact: str | None = None
+    job_title: str | None = None
+    job_url: str | None = Field(
+        default=None,
+        description="Optional job posting URL. Omit it or leave it blank when unavailable.",
+    )
+    category: str = Field(min_length=2)
+    description: str = Field(min_length=20)
     payment_requested: bool = False
     evidence_upload_ids: list[str] = Field(default_factory=list, max_length=5)
 
@@ -104,6 +109,13 @@ class ReportCreateRequest(BaseModel):
             raise ValueError("Recruiter mobile number must contain exactly 10 digits.")
         return value
 
+    @field_validator("recruiter_name")
+    @classmethod
+    def normalize_recruiter_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return value.strip() or None
+
     @field_validator("job_url")
     @classmethod
     def validate_job_url(cls, value: str | None) -> str | None:
@@ -135,6 +147,14 @@ class ReportSubmissionResponse(BaseModel):
     status: str
 
 
+class PublicEvidenceResponse(BaseModel):
+    id: str
+    url: str = Field(description="Backend evidence chunk URL for a public report image.")
+    content_type: str
+    chunk_size_bytes: int
+    chunk_count: int
+
+
 class PublicReportResponse(BaseModel):
     id: str
     company_name: str
@@ -147,10 +167,13 @@ class PublicReportResponse(BaseModel):
     is_redacted: bool
     identifier: str | None
     submitted_by: str | None
+    description: str | None = None
+    evidence: list[PublicEvidenceResponse] = Field(default_factory=list)
     related_count: int = 0
     payment_requested: bool
+    recruiter_name: str | None
     job_title: str | None
-    job_url: str | None
+    job_url: str | None = None
 
 
 class ReportListResponse(BaseModel):
@@ -174,8 +197,8 @@ class SubmissionStatusResponse(BaseModel):
 
 
 class AdminLoginRequest(BaseModel):
-    username: str = Field(min_length=1, max_length=120)
-    password: str = Field(min_length=1, max_length=1024)
+    username: str = Field(min_length=1)
+    password: str = Field(min_length=1)
 
 
 class AdminLoginResponse(BaseModel):
@@ -186,10 +209,9 @@ class AdminLoginResponse(BaseModel):
 
 class ReportReviewRequest(BaseModel):
     status: ReviewDecision
-    review_note: str | None = Field(default=None, max_length=2000)
-    public_summary: str | None = Field(default=None, max_length=1200)
+    review_note: str | None = None
 
-    @field_validator("review_note", "public_summary")
+    @field_validator("review_note")
     @classmethod
     def strip_optional_text(cls, value: str | None) -> str | None:
         if value is None:
@@ -203,6 +225,8 @@ class AdminEvidenceResponse(BaseModel):
     name: str
     content_type: str
     size_bytes: int
+    chunk_size_bytes: int
+    chunk_count: int
 
 
 class AdminReportResponse(PublicReportResponse):
@@ -212,6 +236,7 @@ class AdminReportResponse(PublicReportResponse):
     submitter_name: str
     submitter_email: EmailStr
     is_anonymous: bool
+    recruiter_name: str | None
     recruiter_contact: str | None
     review_note: str | None
     reviewed_at: datetime | None

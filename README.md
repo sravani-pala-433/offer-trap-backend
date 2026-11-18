@@ -1,43 +1,60 @@
 # OfferTrap backend
 
-This backend contains OfferTrap's report submission, evidence storage, public
-archive, review queue, administrator login, moderation history, and approval
-reward ledger. It follows a controller → service → repository layout:
+FastAPI service for report submission, public report details, administrator
+moderation, and evidence images. Neon PostgreSQL stores report and
+evidence metadata; Neon Object Storage stores the image bytes.
 
-- `app/controllers` maps HTTP requests to typed service inputs.
-- `app/services` applies workflow rules and coordinates storage and database work.
-- `app/repositories` contains database queries and persistence operations.
-- `app/core` contains configuration, schemas, database setup, and SQLAlchemy models.
-- `app/utils` contains response serialization, authentication, and error handling.
+## Evidence storage
 
-## Configuration
+Create a private [Neon Object Storage](https://neon.com/blog/building-neon-object-storage)
+bucket for the project/branch, then set
+`AWS_ENDPOINT_URL_S3`, `AWS_REGION`, `AWS_ACCESS_KEY_ID`,
+`AWS_SECRET_ACCESS_KEY`, and `NEON_STORAGE_BUCKET` in the backend environment.
+The four `AWS_*` values are supplied by Neon for the branch; do not expose them
+to the frontend. PostgreSQL keeps only an evidence object-key prefix and its
+metadata. The bucket stays private: public image reads for published reports and
+authenticated admin downloads are proxied through the backend.
 
-Copy `.env.example` to `.env`, then set a PostgreSQL URL, a long random
-`SECRET_KEY`, administrator credentials, and Backblaze B2 S3-compatible API credentials.
-The application does not read or replace your existing `.env` automatically.
-Set `B2_REGION` to the region shown in your bucket details. The endpoint is
-derived as `https://s3.<region>.backblazeb2.com`; optionally set
-`B2_ENDPOINT_URL` if you need to override it. Use a Backblaze application key
-restricted to this bucket, not the account master key. The key needs read-files,
-write-files, and delete-files capabilities for object inspection, promotion,
-and temporary-upload cleanup.
+The frontend has no application-level total file-size cap. Uploads are divided
+into 4 MiB requests because Vercel Functions limit an individual request body
+to 4.5 MB; the backend writes each 4 MiB request as an object in Neon Object
+Storage. Reads use 4 MiB chunks too, and the frontend reassembles them for
+display/download. This is server-mediated (the browser never receives a
+presigned storage URL); Neon Object Storage, rather than Postgres, holds the
+image bytes. Neon's [current Free plan details](https://neon.com/blog/neon-free-plan-1-gb-per-project)
+list 5 GB of Object Storage per project; check Neon's pricing/usage page for
+current limits and costs.
 
-Changing storage providers does not copy existing objects. If previous evidence
-is still in R2, migrate those objects to B2 under the same object keys before
-switching the running backend; otherwise downloads for those existing reports
-will fail.
+Run the cleanup script periodically (for example, hourly) to delete abandoned
+unclaimed uploads after `EVIDENCE_UPLOAD_TTL_MINUTES`:
 
-Keep the B2 bucket private. Configure its CORS policy to allow the frontend
-origin, `PUT`, and the `Content-Type` request header. The presigned signature
-binds the upload to the expected content type. A lifecycle rule for the
-`pending/` prefix can remove abandoned uploads. The backend verifies uploaded
-object size and content type before attaching it to a report; it sets no
-application-level file-size limit.
+```powershell
+python scripts/cleanup_expired_uploads.py
+```
 
-## Database and local start
+## Database migrations
 
-Install the dependencies, apply the initial schema migration, then start the
-FastAPI app from this directory:
+The schema is defined in one initial migration at
+`migrations/versions/0001_offertrap_initial.py`. It uses the short revision ID
+`1`. The migration widens Alembic's PostgreSQL `version_num` tracking column to
+`TEXT`, avoiding its default `VARCHAR(32)` cap; keep future revision IDs numeric
+and short (for example, `2`, `3`) for readability. Since the database tables
+have been dropped, run this against the empty database:
+
+```powershell
+alembic upgrade head
+```
+
+This consolidated migration is for a fresh database. If an `alembic_version`
+table still contains an older revision ID, Alembic will not recognize it after
+the old migration files are removed; confirm that table is empty before
+upgrading.
+
+## Configuration and local start
+
+Copy `.env.example` to `.env`, set the Neon PostgreSQL `DATABASE_URL`, a random
+`SECRET_KEY` with at least 32 characters, administrator credentials, and the
+frontend origins allowed to call the API. Do not commit `.env`.
 
 ```powershell
 python -m pip install -r requirements.txt
@@ -46,46 +63,70 @@ uvicorn main:app --reload
 ```
 
 The API docs are available at `/api/docs`, and the health check is `/health`.
-In Swagger, select **Authorize** and enter the administrator username and
-password. The Swagger OAuth2 flow submits form data to `/api/v1/admin/token`;
-the frontend's JSON login remains available at `/api/v1/admin/login`.
+Swagger admin login uses **Authorize** and posts form data to
+`/api/v1/admin/token`; the frontend's JSON login uses `/api/v1/admin/login`.
+`FRONTEND_ORIGINS` must include each deployed frontend origin and local
+development origin. Evidence requests go to this API, which communicates with
+Neon Object Storage using server-side credentials.
 
-HTTP access logs include timestamp, level, source, request ID, method, path,
-response status, and duration; application and error logs share that request
-ID. Request bodies, query strings, usernames, passwords, and evidence contents
-are not logged. The response includes `X-Request-ID` for correlating a client
-report with server logs.
+## Upload an image with the script
 
-## Frontend connection
+From this directory, upload one JPEG, PNG, or WEBP image through the backend and
+store it in Neon Object Storage through the backend:
 
-Set the frontend's `VITE_API_BASE_URL` to `http://localhost:8000/api/v1` and
-`VITE_ADMIN_LOGIN_MOCK=false` to use the administrator login endpoint. Set
-`FRONTEND_ORIGINS` to the comma-separated frontend origins that should call the
-API. B2 itself also needs its own bucket CORS policy because uploads go directly
-from the browser to B2.
+```powershell
+python scripts/upload_evidence.py "C:\path\to\evidence.png"
+```
+
+The default API base is `http://localhost:8000/api/v1`. To use a deployed API:
+
+```powershell
+python scripts/upload_evidence.py "C:\path\to\evidence.png" --api-base https://your-backend-domain/api/v1
+```
+
+Add `--submit-report` to enter report fields interactively and create a real
+report after the image upload. Use a local or staging database while testing:
+
+```powershell
+python scripts/upload_evidence.py "C:\path\to\evidence.png" --submit-report
+```
+
+Without `--submit-report`, the image remains an unclaimed upload until its
+expiry and is removed from Neon Object Storage by the cleanup script. The script
+sends each 4 MiB chunk to the backend; it does not contact storage directly or
+require browser CORS.
 
 ## Moderation and privacy
 
-The public archive returns every public report, but redacts the raw description,
-recruiter contact, job URL, and reviewed summary until approval. Contributor
-email is never included in public responses. The admin API requires a bearer
-token, returns private report fields, and streams evidence through the backend.
-Each status change is appended to `moderation_logs`.
+New reports are published immediately with status `submitted` (shown as
+`Published - unverified`). Their description, recruiter contact, optional job
+URL, and attached images are public. The submitter name is public unless they
+selected anonymous attribution; their email is always private. An administrator
+can reject an entire report, which hides the report and all of its evidence from
+public routes. Evidence is not individually approved or rejected. Admin
+endpoints require a bearer token and expose the private fields needed for review.
 
-An approval awards `REWARD_POINTS_PER_APPROVED_REPORT` points to that report's
-submitter. The status endpoint reports points earned for that report. If an
-approved report is later moved to another status, the ledger records a matching
-reversal instead of deleting its history.
+This workflow has no approval or verification action, so it does not award
+reward points. The legacy reward ledger table remains for data compatibility;
+a separate reward policy is needed before credits can be issued.
+
+HTTP access logs include timestamp, level, source, request ID, method, path,
+response status, and duration. Request bodies, query strings, credentials, and
+evidence contents are not logged. Responses include `X-Request-ID` for
+correlating a client report with server logs.
 
 ## API routes
 
 - `GET /api/v1/reports` — public search and pagination.
 - `GET /api/v1/reports/{id}` — public-safe report details.
-- `GET /api/v1/reports/{id}/status` — submission status and reward points.
-- `POST /api/v1/uploads/presign` — create short-lived direct-to-B2 upload URLs.
-- `POST /api/v1/reports` — submit a report and claim verified uploads.
+- `GET /api/v1/reports/{id}/status` — whether the report remains published or was rejected.
+- `POST /api/v1/uploads` — initialize a chunked backend upload.
+- `PUT /api/v1/uploads/{upload_id}/chunks/{index}` — write one image chunk.
+- `POST /api/v1/uploads/{upload_id}/complete` — verify and finalize an upload.
+- `POST /api/v1/reports` — submit a report and claim completed uploads.
+- `GET /api/v1/reports/{id}/evidence/{evidence_id}/chunks/{index}` — published report image chunk.
 - `POST /api/v1/admin/login` — administrator login.
 - `POST /api/v1/admin/token` — form-encoded login for Swagger's **Authorize** button.
-- `GET /api/v1/admin/reports` — filter and search the moderation queue.
-- `PATCH /api/v1/admin/reports/{id}/status` — approve, reject, or request information.
-- `GET /api/v1/admin/evidence/{id}` — authenticated evidence download.
+- `GET /api/v1/admin/reports` — filter by status, search, or exact submitter email (`submitter_email`).
+- `PATCH /api/v1/admin/reports/{id}/status` — reject a whole report.
+- `GET /api/v1/admin/evidence/{id}/chunks/{index}` — authenticated evidence chunk.
